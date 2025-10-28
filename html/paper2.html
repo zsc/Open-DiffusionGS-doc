@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base href="./">
+    <title>Untitled</title>
+    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/highlight.css">
+    <script src="assets/script.js" defer></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$']],
+                displayMath: [['$$', '$$']],
+                processEscapes: false,
+                packages: {'[+]': ['noerrors', 'ams']}
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            },
+            loader: {
+                load: ['[tex]/noerrors', '[tex]/ams']
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h3>目录</h3>
+                <button id="sidebar-toggle" class="sidebar-toggle">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebar-search-input" placeholder="搜索..." autocomplete="off">
+            </div>
+            <div id="tree-container">
+                <ul class="nav-list"><li class=""><a href="base_scene.html">base_scene.py 源码解析</a></li><li class=""><a href="denoiser.html">denoiser.py 源码解析</a></li><li class=""><a href="diffusion_gs_system_scene.html">diffusion_gs_system_scene.py 源码解析</a></li><li class=""><a href="gaussian_diffusion.html">gaussian_diffusion.py 源码解析</a></li><li class=""><a href="launch.html">launch.py 源码解析</a></li><li class=""><a href="overview.html">DiffusionGS 项目总览 (Overview)</a></li><li class=""><a href="paper.html">Untitled</a></li><li class="active"><a href="paper2.html">Untitled</a></li><li class=""><a href="pipline_obj.html">pipline_obj.py 源码解析</a></li><li class=""><a href="renderer.html">renderer.py 源码解析</a></li></ul>
+            </div>
+        </nav>
+        
+        <main class="content">
+            <article>
+                <p>下面把这篇论文 <strong>《Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single‑stage Image‑to‑3D Generation and Reconstruction》</strong>（简称 <strong>DiffusionGS</strong>）做一次要点+技术细读。</p>
+<hr />
+<h2 id="_1">一句话结论</h2>
+<p>作者把“<strong>3D 高斯云（3D Gaussian Splatting, 3DGS）</strong>”直接<strong>烘焙进扩散模型的去噪器</strong>里，使模型在每个时间步都<strong>直接输出三维高斯点云</strong>，再用可微光栅化渲染到多视图做监督，从而天然保证三维一致性；配合新的<strong>相机条件编码 RPPC</strong>与<strong>场景—物体混合训练</strong>，在单图像到 3D 的<strong>生成与重建</strong>两线都更快（A100 上约 6 秒）且更稳。相比以往方法，物体/场景上分别提升 <strong>+2.20 dB / −23.25 FID</strong> 与 <strong>+1.34 dB / −19.16 FID</strong>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<blockquote>
+<p>该工作已被 <strong>ICCV 2025</strong> 接收（论文页码 25062–25072）。(<a href="https://openaccess.thecvf.com/content/ICCV2025/html/Cai_Baking_Gaussian_Splatting_into_Diffusion_Denoiser_for_Fast_and_Scalable_ICCV_2025_paper.html?utm_source=chatgpt.com" title="ICCV 2025 Open Access Repository">CVF Open Access</a>)</p>
+</blockquote>
+<hr />
+<h2 id="_2">解决什么问题</h2>
+<p>以往的<strong>两阶段</strong>做法先用 <strong>2D 多视图扩散</strong>合成一组视图，再做 3D 重建——但 2D 扩散里<strong>没有 3D 表示</strong>，易视角不一致、换提示视角就崩；另一类用 <strong>triplane/NeRF</strong> 的“3D 扩散 + 2D 渲染损失”则<strong>渲染慢、分辨率受限</strong>，难扩展到大场景。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<hr />
+<h2 id="diffusiongs">方法总览（DiffusionGS）</h2>
+<p><strong>核心思想：</strong>把 3DGS 作为扩散去噪器的<strong>直接输出目标</strong>。在每个时间步 (t)，网络对条件视图 + (N) 个噪声视图进行去噪，<strong>逐像素</strong>预测一组高斯基元（固定数量），并通过<strong>可微高斯光栅化</strong>渲染出多视图，与“干净”多视图进行监督。采样阶段用 <strong>DDIM 约 30 步</strong>加速推理。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<h3 id="1-3d">1) 直接预测 3D 高斯</h3>
+<p>输出是逐像素的高斯集合 (G_t^{(k)}={\mu\in\mathbb{R}^3,\ \Sigma\in\mathbb{R}^{3\times3},\ \alpha,\ c})（中心、协方差、透明度、RGB），数量为 ((N+1)HW)。与常见的“预测噪声 (\epsilon)”不同，作者采用 <strong>(x_0)-prediction</strong> 并在每步把预测的干净多视图丢回扩散链，保证视间一致的几何与纹理。渲染损失采用 <strong>(L_2)+VGG 感知损失</strong>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<h3 id="2-rppc">2) 新的相机条件编码 <strong>RPPC</strong></h3>
+<p>以往把<strong>Plücker 射线坐标</strong> ((o\times d,\ d)) 作为逐像素相机条件，但对<strong>相对深度</strong>不敏感。作者改为 <strong>Reference‑Point Plücker Coordinate</strong>：
+[
+r=(o-(o\cdot d)d,\ d)
+]
+即把“射线上距离世界原点最近的点”作为参考，具备<strong>平移不变性</strong>，能提供更直接的“射线位置+相对深度”线索，显著利于几何感知。</p>
+<h3 id="3">3) 场景—物体<strong>混合训练</strong> + <strong>双解码器</strong></h3>
+<p>直接把场景/物体数据混在一起会<strong>难以收敛</strong>。作者设计了：</p>
+<ul>
+<li><strong>视角选择约束</strong>：对视点位置与朝向施加<strong>两组夹角阈值</strong>，控制条件视图、噪声视图与监督新视图之间的重叠与覆盖，利于稳定训练；</li>
+<li><strong>双高斯解码器</strong>：物体与场景的<strong>深度范围</strong>差异大（如物体 ([0.1,4.2])，场景 ([0,500])），训练时用两套 MLP 解码器并在微调阶段保留对分支；(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+<li><strong>损失设计</strong>：除去噪/新视图渲染损失外，为物体生成加入<strong>点云分布暖启动损失</strong> (L_{pd})，鼓励点更集中、结构更规整。</li>
+</ul>
+<hr />
+<h2 id="_3">训练与实现细节</h2>
+<p>数据：<strong>Objaverse、MVImgNet</strong>（物体），<strong>RealEstate10K、DL3DV10K</strong>（场景），并在 <strong>ABO、GSO</strong> 等上评测。工程上用 <strong>PyTorch+Adam</strong>，混合精度（BF16）、子线性显存与<strong>延迟渲染</strong>等技巧。混合训练阶段 <strong>32×A100、40K iter</strong>；随后物体/场景微调分别用 <strong>64×A100</strong>，约 <strong>80K / 54K iter</strong>（单卡 batch 8/16）。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<hr />
+<h2 id="_4">实验结果（摘选）</h2>
+<ul>
+<li><strong>速度</strong>：单张输入到 3D 点云（含渲染）A100 上约 <strong>6 秒</strong>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+<li><strong>整体效果</strong>：对比 2D 多视图+重建及 3D‑NeRF‑triplane 路线，在<strong>物体生成</strong>与<strong>单视图场景重建</strong>上都取得更好<strong>PSNR / FID</strong>，并在用户偏好与运行时间上占优。</li>
+<li><strong>数值提升</strong>：物体/场景分别 <strong>+2.20 dB / −23.25 FID</strong> 与 <strong>+1.34 dB / −19.16 FID</strong>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+<li><strong>对比 PhotoNVS（2D 视图合成+事后 3DGS）</strong>：后者在新视图会出现模糊/错位/黑斑，且事后拟合花时长；DiffusionGS 直接沿相机轨迹生成并重建，更<strong>抗遮挡</strong>、几何更规整。</li>
+<li>
+<p><strong>消融</strong>：</p>
+</li>
+<li>
+<p><strong>仅监督的去噪器基线</strong>在 GSO 上 PSNR/FID 明显落后；引入扩散框架→显著提升。</p>
+</li>
+<li><strong>混合训练</strong>与 <strong>RPPC</strong> 都有<strong>可观收益</strong>；在 RealEstate10K 上，单独引入 RPPC 约 <strong>+0.28 dB PSNR、−7.09 FID</strong>，能更好地还原大场景结构。</li>
+</ul>
+<hr />
+<h2 id="_5">与相关工作的关系</h2>
+<p>作者把现有方法归纳为：<strong>(1) 直接 3D 监督</strong>（难以获得大规模 3D 数据）；<strong>(2) SDS 蒸馏</strong>（每个资产要慢速优化）；<strong>(3) 相机条件的 2D 扩散</strong>（不保三维一致）；<strong>(4) 3D 扩散 + 2D 渲染</strong>（triplane/NeRF 受分辨率与体渲染速度限制）。DiffusionGS 走了“<strong>单阶段 3D 扩散</strong>”并用 <strong>3DGS 的可并行光栅化</strong>解决速度/扩展性。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<hr />
+<h2 id="_6">优点与可能的局限</h2>
+<p><strong>优点</strong>：</p>
+<ul>
+<li><strong>天然三维一致</strong>（每步就是 3D）；</li>
+<li><strong>速度快</strong>、可扩到<strong>大场景</strong>（3DGS 光栅化）；</li>
+<li><strong>无需单目深度估计器</strong>，遮挡/大视角变化下更稳。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+</ul>
+<p><strong>可能的局限/边界</strong>（论文未专设“局限”段，这里基于实现与实验范围做理性推断）：</p>
+<ul>
+<li>训练<strong>算力需求大</strong>（数十张 A100、多万步迭代）；(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+<li>3DGS 在<strong>极薄结构、强透明/镜面材质</strong>上天生较难；</li>
+<li>推理虽快，但<strong>仍需相机轨迹与渲染</strong>，对实时交互/移动端仍有距离。
+  （以上非论文直接表述，供读者评估落地成本与适用边界。）</li>
+</ul>
+<hr />
+<h2 id="_7">复现与上手</h2>
+<p>作者给出了开源实现 <strong>Open‑DiffusionGS</strong>（说明为<strong>重新实现与重新训练版本</strong>，与 Adobe 内部原版不同，代码/权重可能有差异）。仓库强调本方法<strong>不依赖 2D 多视图扩散</strong>，单阶段直接输出 3DGS。(<a href="https://github.com/caiyuanhao1998/Open-DiffusionGS?utm_source=chatgpt.com" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast ...">GitHub</a>)
+项目页提供了<strong>视频与交互展示</strong>便于理解效果与速度。(<a href="https://caiyuanhao1998.github.io/project/DiffusionGS/?utm_source=chatgpt.com" title="DiffusionGS: Baking Gaussian Splatting into Diffusion ...">Yuanhao Cai</a>)</p>
+<hr />
+<h2 id="_8">小结</h2>
+<p>DiffusionGS 的关键在于把<strong>三维表示（3DGS）</strong>作为扩散去噪器的<strong>一等公民</strong>：训练时以<strong>多视图渲染监督</strong>约束其三维一致性；推理时<strong>少步采样</strong>即可得到<strong>稳定几何</strong>与<strong>清晰纹理</strong>。结合 <strong>RPPC</strong> 的相机表征与<strong>场景—物体混合训练</strong>，它把<strong>单图像到 3D</strong>从“两阶段+事后重建”推进到<strong>单阶段端到端</strong>，在质量、稳健性与速度上都取得实质跃升。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<blockquote>
+<p>参考：论文 PDF（含方法/消融/表格）、ICCV 2025 页面、项目页与开源实现。</p>
+</blockquote>
+<hr />
+<p>好的！我把上面的要点压成几张精简表，便于速览与对比。</p>
+<h3 id="1">1) 论文速览</h3>
+<p>| 条目      | 内容                                                                   |</p>
+<table>
+<thead>
+<tr>
+<th>条目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>标题 / 简称</td>
+<td>Baking Gaussian Splatting into Diffusion Denoiser… / <strong>DiffusionGS</strong></td>
+</tr>
+<tr>
+<td>任务</td>
+<td>单图像 → 3D（生成 &amp; 重建），同时覆盖<strong>物体</strong>与<strong>场景</strong></td>
+</tr>
+<tr>
+<td>核心思路</td>
+<td>把 <strong>3D Gaussian Splatting (3DGS)</strong> 直接作为<strong>扩散去噪器输出</strong>，每步可微光栅化→多视图监督</td>
+</tr>
+<tr>
+<td>关键创新</td>
+<td>① 直接预测3DGS；② 相机条件<strong>RPPC</strong>；③ <strong>场景—物体混合训练</strong>与<strong>双解码器</strong>；④ 视角选择约束</td>
+</tr>
+<tr>
+<td>采样/速度</td>
+<td>采用 <strong>DDIM ~30步</strong>；A100 上单图到3D约 <strong>~6 秒</strong>（论文报告）</td>
+</tr>
+<tr>
+<td>损失</td>
+<td>渲染 (L_2) + VGG 感知；物体系加入<strong>点云分布暖启动损失</strong> (L_{pd})</td>
+</tr>
+<tr>
+<td>输出形式</td>
+<td>稳定几何与纹理的<strong>3D 高斯云</strong>（可直接渲染/后续网格化）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="2">2) 方法组件与作用</h3>
+<p>| 模块             | 做什么              | 关键细节                                                                       |</p>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>做什么</th>
+<th>关键细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3DGS 直接预测</td>
+<td>去噪器逐像素输出高斯基元集合</td>
+<td>参数：中心 (\mu)、协方差 (\Sigma)、透明度 (\alpha)、颜色 (c)；固定基元数；采用 <strong>(x_0)-prediction</strong></td>
+</tr>
+<tr>
+<td>可微高斯光栅化</td>
+<td>把 3DGS 渲染为多视图做监督</td>
+<td>并行高效，天然保证跨视角一致性</td>
+</tr>
+<tr>
+<td><strong>RPPC</strong>（相机条件）</td>
+<td>提供更稳的射线/深度线索</td>
+<td>使用“参考点 Plücker 坐标”，具平移不变性、相对深度更明确</td>
+</tr>
+<tr>
+<td>双解码器（物体/场景）</td>
+<td>解决不同深度尺度分布</td>
+<td>两套 MLP 分支，微调阶段保留对应分支</td>
+</tr>
+<tr>
+<td>视角选择约束</td>
+<td>稳定混合训练收敛</td>
+<td>对条件/噪声/新视图设定两组夹角阈值，控制覆盖与重叠</td>
+</tr>
+<tr>
+<td>损失设计</td>
+<td>提升感知质量与结构规整</td>
+<td>渲染 (L_2)+VGG；物体系加 (L_{pd}) 聚拢点云分布</td>
+</tr>
+<tr>
+<td>采样策略</td>
+<td>加速推理</td>
+<td><strong>DDIM</strong> 少步采样（~30 步）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="3_1">3) 数据、训练与结果（摘选）</h3>
+<p>| 维度       | 物体                                                                                | 场景                                       |</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>物体</th>
+<th>场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练/评测数据</td>
+<td>训练：Objaverse、MVImgNet；评测含 ABO、GSO</td>
+<td>训练：RealEstate10K、DL3DV-10K 等</td>
+</tr>
+<tr>
+<td>工程设置（论文）</td>
+<td>PyTorch、BF16、子线性显存&amp;延迟渲染；混合训练约 <strong>32×A100 / 40K iter</strong>，物体微调 <strong>64×A100 / ~80K iter</strong></td>
+<td>场景微调 <strong>64×A100 / ~54K iter</strong>（批量大小因集不同而异）</td>
+</tr>
+<tr>
+<td>指标提升（论文）</td>
+<td>相比代表方法：<strong>+2.20 dB PSNR / −23.25 FID</strong></td>
+<td><strong>+1.34 dB PSNR / −19.16 FID</strong></td>
+</tr>
+<tr>
+<td>质性对比</td>
+<td>对 PhotoNVS 等两阶段路线：新视角更清晰、几何更稳、抗遮挡更好</td>
+<td>与 NeRF/triplane 等 3D 扩散+体渲染：渲染更快、分辨率更易扩展</td>
+</tr>
+<tr>
+<td>推理速度</td>
+<td>单图到3D约 <strong>~6 秒/A100</strong>（含渲染）</td>
+<td>同左</td>
+</tr>
+</tbody>
+</table>
+<h3 id="4">4) 优 &amp; 可能局限</h3>
+<p>| 优点                                      | 可能局限（含基于实现的理性推断）                      |</p>
+<table>
+<thead>
+<tr>
+<th>优点</th>
+<th>可能局限（含基于实现的理性推断）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>天然<strong>三维一致性</strong>；<strong>推理快</strong>；可扩到<strong>大场景</strong>；无需单目深度先验</td>
+<td>训练<strong>算力开销大</strong>；极薄结构/强透明材质相对困难；移动端/实时仍有距离</td>
+</tr>
+</tbody>
+</table>
+<h3 id="5">5) 复现与资源</h3>
+<p>| 项目               | 说明                                                |</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Open-DiffusionGS</td>
+<td>作者团队给出的<strong>开源再实现/再训练版本</strong>（与内部原版可能存在差异）；配套项目页含视频/交互展示</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>注：数值与设定均为论文 <strong>arXiv:2411.14384</strong> 报告；“局限”列含合理推断，供评估落地边界参考。
+如果需要，我可以把这些表导出为 <strong>CSV/Excel</strong> 或加上你关心的基准/对比方法列。</p>
+</blockquote>
+            </article>
+            
+            <nav class="page-nav"><a href="paper.html" class="nav-link prev">← Untitled</a><a href="pipline_obj.html" class="nav-link next">pipline_obj.py 源码解析 →</a></nav>
+        </main>
+    </div>
+</body>
+</html>
