@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base href="./">
+    <title>denoiser.py 源码解析</title>
+    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/highlight.css">
+    <script src="assets/script.js" defer></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$']],
+                displayMath: [['$$', '$$']],
+                processEscapes: false,
+                packages: {'[+]': ['noerrors', 'ams']}
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            },
+            loader: {
+                load: ['[tex]/noerrors', '[tex]/ams']
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h3>目录</h3>
+                <button id="sidebar-toggle" class="sidebar-toggle">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebar-search-input" placeholder="搜索..." autocomplete="off">
+            </div>
+            <div id="tree-container">
+                <ul class="nav-list"><li class=""><a href="base_scene.html">base_scene.py 源码解析</a></li><li class="active"><a href="denoiser.html">denoiser.py 源码解析</a></li><li class=""><a href="diffusion_gs_system_scene.html">diffusion_gs_system_scene.py 源码解析</a></li><li class=""><a href="gaussian_diffusion.html">gaussian_diffusion.py 源码解析</a></li><li class=""><a href="launch.html">launch.py 源码解析</a></li><li class=""><a href="overview.html">DiffusionGS 项目总览 (Overview)</a></li><li class=""><a href="paper.html">Untitled</a></li><li class=""><a href="pipline_obj.html">pipline_obj.py 源码解析</a></li><li class=""><a href="renderer.html">renderer.py 源码解析</a></li></ul>
+            </div>
+        </nav>
+        
+        <main class="content">
+            <article>
+                <h1 id="denoiserpy">denoiser.py 源码解析</h1>
+<p><code>denoiser.py</code> 文件定义了 <code>DGSDenoiser</code> 类，这是 DiffusionGS 模型的核心，也是在 <code>PointDiffusionSystem</code> 中被引用的 <code>shape_model</code>。这个类继承自 <code>BaseModule</code>，其主要职责是在扩散过程的每个时间步，根据带噪声的图像和相机信息，预测出 3D 高斯分布（Gaussian Splatting）的参数。它是连接 2D 图像信息和 3D 场景表示的关键模块。</p>
+<h2 id="_1">核心类与功能</h2>
+<h3 id="dgsdenoiser"><code>DGSDenoiser</code> 类</h3>
+<p><code>DGSDenoiser</code> 是一个基于 Transformer 的去噪模型，专门用于从 2D 图像（及其姿态信息）生成 3D 高斯分布。</p>
+<h4 id="configureself"><code>configure(self)</code></h4>
+<ul>
+<li><strong>功能</strong>: 初始化 <code>DGSDenoiser</code> 的所有子模块。这些模块协同工作，完成了从输入处理到最终高斯参数输出的整个流程。</li>
+<li><strong>核心子模块</strong>:<ul>
+<li><code>t_embedder</code>: <code>TimestepEmbedder</code> 的实例，负责将扩散过程中的标量时间步 <code>t</code> 转换为高维向量嵌入，以便作为条件注入到 Transformer 模型中。</li>
+<li><code>image_tokenizer</code>: 一个 <code>nn.Sequential</code> 模块，负责将输入的图像“通证化”（Tokenize）。它首先将图像分割成多个小块（Patch），然后通过一个线性层将每个 Patch 转换为一个高维度的特征向量（Token）。</li>
+<li><code>gaussians_pos_embedding</code>: 一个可学习的 <code>nn.Parameter</code>，它为“全局高斯”提供位置嵌入。这些全局高斯不与图像的任何特定部分对齐，而是用于捕捉物体的整体结构。</li>
+<li><code>transformer</code>: 一个由多个 <code>DiTBlock</code>（Diffusion Transformer Block）组成的 <code>nn.ModuleList</code>。这是模型的主体，负责处理连接后的图像 Tokens 和全局高斯 Tokens，并根据时间步嵌入进行条件化处理。</li>
+<li><code>upsampler</code>: <code>GaussiansUpsampler</code> 的实例，负责将 Transformer 输出的全局高斯 Tokens 解码为最终的 3D 高斯参数（xyz, features, scaling, rotation, opacity）。</li>
+<li><code>image_token_decoder</code>: <code>ImageTokenDecoder</code> 的实例，负责将 Transformer 输出的图像对齐 Tokens 解码为对应像素的 3D 高斯参数。</li>
+<li><code>gs_renderer</code>: <code>Renderer</code> 的实例，用于将生成的高斯分布渲染成 2D 图像。</li>
+</ul>
+</li>
+</ul>
+<h4 id="image_to_gaussiansself-images-ray_o-ray_d-t-trainingfalse"><code>image_to_gaussians(self, images, ray_o, ray_d, t, training=False)</code></h4>
+<ul>
+<li><strong>功能</strong>: 这是 <code>DGSDenoiser</code> 的核心前向传播方法，实现了从带噪声图像到 3D 高斯分布的完整转换逻辑。</li>
+<li><strong>流程</strong>:<ol>
+<li><strong>输入准备</strong>: 将输入的（带噪声的）图像与相机光线信息（<code>ray_o</code>, <code>ray_d</code>，即光心和方向）结合，形成“姿态化”的图像 <code>posed_images</code>。这些光线信息为模型提供了关键的 3D 几何线索。</li>
+<li><strong>通证化 (Tokenization)</strong>: 使用 <code>image_tokenizer</code> 将 <code>posed_images</code> 转换为图像 Tokens (<code>img_tokens</code>)。</li>
+<li><strong>时间步嵌入</strong>: 使用 <code>t_embedder</code> 将时间步 <code>t</code> 转换为向量嵌入。</li>
+<li><strong>Transformer 处理</strong>: 将“全局高斯”的 <code>gaussians_pos_embedding</code> 和 <code>img_tokens</code> 连接起来，送入 <code>transformer</code> 网络。Transformer 在时间步嵌入的条件下，对这些 Tokens 进行深度处理和信息交互。</li>
+<li><strong>解码 (Decoding)</strong>: 将 Transformer 的输出重新分离为全局高斯 Tokens 和图像对齐 Tokens。<ul>
+<li>全局高斯 Tokens 通过 <code>upsampler</code> 解码，生成全局高斯的参数。</li>
+<li>图像对齐 Tokens 通过 <code>image_token_decoder</code> 解码，生成与图像像素对齐的高斯参数。</li>
+</ul>
+</li>
+<li><strong>XYZ 坐标校正</strong>: 对图像对齐的高斯分布的 <code>xyz</code> 坐标进行一个关键的校正。这一步利用相机光线信息，确保这些高斯点被“投射”到 3D 空间中的正确位置，从而与输入图像的几何关系保持一致。</li>
+<li><strong>输出</strong>: 返回所有高斯（全局 + 图像对齐）的完整参数集合，包括 <code>xyz</code>, <code>features</code>, <code>scaling</code>, <code>rotation</code>, <code>opacity</code>。</li>
+</ol>
+</li>
+</ul>
+<h4 id="render_gaussiansself"><code>render_gaussians(self, ...)</code></h4>
+<ul>
+<li><strong>功能</strong>: 接收 <code>image_to_gaussians</code> 生成的高斯参数，并利用 <code>gs_renderer</code> 将这些 3D 高斯分布渲染成指定视角的 2D 图像。</li>
+</ul>
+<h2 id="_2">关键设计理念</h2>
+<ul>
+<li><strong>两种高斯分布的结合</strong>: 模型同时预测两种类型的高斯分布，这是一个核心设计。<ul>
+<li><strong>全局高斯 (Global Gaussians)</strong>: 数量较少，负责捕捉物体的整体、低频结构。</li>
+<li><strong>图像对齐高斯 (Image-Aligned Gaussians)</strong>: 数量较多，与输入图像的像素对齐，负责捕捉物体的细节和高频信息。</li>
+</ul>
+</li>
+<li><strong>扩散 Transformer (DiT)</strong>: 采用强大的 Transformer 架构作为去噪网络的主干，使其能够高效地处理图像和高斯 Tokens 序列，并根据时间步进行条件生成。</li>
+<li><strong>光线索 (Plenoptic Cues)</strong>: 将相机光线信息作为输入的一部分，为模型提供了必要的 3D 几何约束，使其能够更准确地推断 3D 结构。</li>
+</ul>
+<h2 id="_3">总结</h2>
+<p><code>denoiser.py</code> 中的 <code>DGSDenoiser</code> 是 DiffusionGS 能够从单张 2D 图像生成高质量 3D 模型的“魔法”所在。它通过一个精心设计的 Transformer 网络，巧妙地结合了全局和局部的 3D 表示，并利用光线信息作为几何引导，最终在扩散模型的框架下，实现了从噪声到精细 3D 高斯分布的生成。</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">graph</span><span class="w"> </span><span class="nt">TD</span>
+<span class="w">    </span><span class="nt">A</span><span class="cp">[</span><span class="nx">输入</span><span class="p">:</span><span class="w"> </span><span class="nx">带噪声图像</span><span class="p">,</span><span class="w"> </span><span class="nx">相机光线</span><span class="p">,</span><span class="w"> </span><span class="nx">时间步</span><span class="w"> </span><span class="nx">t</span><span class="cp">]</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">B</span><span class="o">(</span><span class="nt">DGSDenoiser</span><span class="o">);</span>
+<span class="w">    </span><span class="nt">B</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">C</span><span class="p">{</span><span class="err">image_to_gaussians</span><span class="w"> </span><span class="err">方法</span><span class="p">}</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">C</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">D</span><span class="cp">[</span><span class="mi">1</span><span class="nx">.</span><span class="w"> </span><span class="nx">准备输入</span><span class="w"> </span><span class="p">(</span><span class="nx">图像</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">光线</span><span class="p">)</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">D</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">E</span><span class="cp">[</span><span class="mi">2</span><span class="nx">.</span><span class="w"> </span><span class="nx">图像通证化</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">E</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">F</span><span class="cp">[</span><span class="mi">3</span><span class="nx">.</span><span class="w"> </span><span class="nx">时间步嵌入</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">F</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">G</span><span class="cp">[</span><span class="mi">4</span><span class="nx">.</span><span class="w"> </span><span class="nx">全局高斯</span><span class="w"> </span><span class="nx">Token</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">图像</span><span class="w"> </span><span class="nx">Token</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">G</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">H</span><span class="cp">[</span><span class="mi">5</span><span class="bp">.</span><span class="w"> </span><span class="nx nx-Member">Transformer</span><span class="w"> </span><span class="nx">处理</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">H</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">I</span><span class="cp">[</span><span class="mi">6</span><span class="nx">.</span><span class="w"> </span><span class="nx">解码</span><span class="w"> </span><span class="p">(</span><span class="nx">全局</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">图像对齐</span><span class="p">)</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">I</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">J</span><span class="cp">[</span><span class="mi">7</span><span class="bp">.</span><span class="w"> </span><span class="nx nx-Member">XYZ</span><span class="w"> </span><span class="nx">坐标校正</span><span class="cp">]</span><span class="o">;</span>
+<span class="w">    </span><span class="nt">J</span><span class="w"> </span><span class="nt">--</span><span class="o">&gt;</span><span class="w"> </span><span class="nt">K</span><span class="cp">[</span><span class="nx">输出</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="nx">D</span><span class="w"> </span><span class="nx">高斯参数</span><span class="cp">]</span><span class="o">;</span>
+</code></pre></div>
+            </article>
+            
+            <nav class="page-nav"><a href="base_scene.html" class="nav-link prev">← base_scene.py 源码解析</a><a href="diffusion_gs_system_scene.html" class="nav-link next">diffusion_gs_system_scene.py 源码解析 →</a></nav>
+        </main>
+    </div>
+</body>
+</html>

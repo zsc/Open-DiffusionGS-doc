@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base href="./">
+    <title>launch.py 源码解析</title>
+    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/highlight.css">
+    <script src="assets/script.js" defer></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$']],
+                displayMath: [['$$', '$$']],
+                processEscapes: false,
+                packages: {'[+]': ['noerrors', 'ams']}
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            },
+            loader: {
+                load: ['[tex]/noerrors', '[tex]/ams']
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h3>目录</h3>
+                <button id="sidebar-toggle" class="sidebar-toggle">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebar-search-input" placeholder="搜索..." autocomplete="off">
+            </div>
+            <div id="tree-container">
+                <ul class="nav-list"><li class=""><a href="base_scene.html">base_scene.py 源码解析</a></li><li class=""><a href="denoiser.html">denoiser.py 源码解析</a></li><li class=""><a href="diffusion_gs_system_scene.html">diffusion_gs_system_scene.py 源码解析</a></li><li class=""><a href="gaussian_diffusion.html">gaussian_diffusion.py 源码解析</a></li><li class="active"><a href="launch.html">launch.py 源码解析</a></li><li class=""><a href="overview.html">DiffusionGS 项目总览 (Overview)</a></li><li class=""><a href="paper.html">Untitled</a></li><li class=""><a href="pipline_obj.html">pipline_obj.py 源码解析</a></li><li class=""><a href="renderer.html">renderer.py 源码解析</a></li></ul>
+            </div>
+        </nav>
+        
+        <main class="content">
+            <article>
+                <h1 id="launchpy">launch.py 源码解析</h1>
+<p><code>launch.py</code> 是一个通用的启动脚本，用于执行基于 PyTorch Lightning 的训练、验证、测试和导出任务。它本身不包含特定于某个模型（如物体生成或场景重建）的逻辑，而是通过解析命令行参数和配置文件来动态加载和运行指定的模块。</p>
+<h2 id="_1">核心功能</h2>
+<p><code>launch.py</code> 的核心功能是设置 PyTorch Lightning 的训练环境，并根据用户的指令启动相应的流程。</p>
+<h3 id="1">1. 参数解析</h3>
+<p>脚本使用 <code>argparse</code> 来解析命令行参数，其中最重要的几个参数是：</p>
+<ul>
+<li><code>--config</code>: 指向一个 YAML 配置文件，这是<strong>最核心的参数</strong>，因为它定义了整个实验的所有配置，包括使用哪个数据模块、哪个系统模块、模型的超参数、优化器设置等。</li>
+<li><code>--gpu</code>: 指定要使用的 GPU 设备。</li>
+<li><code>--train</code>, <code>--validate</code>, <code>--test</code>, <code>--export</code>: 这些是互斥的标志，用于指定要执行的操作模式（训练、验证、测试或导出）。</li>
+</ul>
+<h3 id="2">2. 动态模块加载</h3>
+<p><code>launch.py</code> 的设计精髓在于其<strong>动态性</strong>。它不硬编码任何特定的数据或模型，而是使用 <code>diffusionGS.find</code> 函数，根据配置文件中的字符串名称来查找并实例化对应的类。</p>
+<ul>
+<li><strong>数据模块 (DataModule)</strong>: <code>dm = diffusionGS.find(cfg.data_type)(cfg.data)</code><ul>
+<li>它读取配置文件中的 <code>data_type</code> 字段（例如 <code>"Re10k-datamodule"</code>），然后在注册表中找到对应的类，并用 <code>cfg.data</code> 中的配置来实例化它。</li>
+</ul>
+</li>
+<li><strong>系统模块 (System)</strong>: <code>system: BaseSystem = diffusionGS.find(cfg.system_type)(cfg.system, ...)</code><ul>
+<li>同理，它读取 <code>system_type</code> 字段（例如 <code>"diffusion-gs-scene-system"</code>），找到对应的 <code>pl.LightningModule</code> 子类（如 <code>PointDiffusionSystem</code>），并用 <code>cfg.system</code> 中的配置来实例化它。</li>
+</ul>
+</li>
+</ul>
+<h3 id="3-pytorch-lightning-trainer">3. PyTorch Lightning <code>Trainer</code> 的配置和执行</h3>
+<p>脚本的核心是配置和使用 <code>pytorch_lightning.Trainer</code>。</p>
+<ul>
+<li><strong>回调 (Callbacks)</strong>: 它会根据配置设置一系列的回调，例如：<ul>
+<li><code>ModelCheckpoint</code>: 用于保存模型的检查点。</li>
+<li><code>LearningRateMonitor</code>: 监控学习率的变化。</li>
+<li><code>EMA</code> (Exponential Moving Average): 如果启用，会使用 EMA 来平滑模型权重。</li>
+<li>以及一些自定义的回调，如 <code>CodeSnapshotCallback</code>（保存代码快照）和 <code>ConfigSnapshotCallback</code>（保存配置快照）。</li>
+</ul>
+</li>
+<li><strong>日志记录器 (Loggers)</strong>: 设置 <code>TensorBoardLogger</code> 和 <code>CSVLogger</code> 来记录训练过程中的指标。</li>
+<li><strong>启动训练/评估</strong>: 最后，根据命令行参数，调用 <code>Trainer</code> 的相应方法来启动任务：<ul>
+<li><code>trainer.fit(system, datamodule=dm, ...)</code>: 启动训练。</li>
+<li><code>trainer.validate(system, datamodule=dm, ...)</code>: 启动验证。</li>
+<li><code>trainer.test(system, datamodule=dm, ...)</code>: 启动测试。</li>
+<li><code>trainer.predict(system, datamodule=dm, ...)</code>: 启动预测（用于导出）。</li>
+</ul>
+</li>
+</ul>
+<h2 id="_2">总结</h2>
+<p><code>launch.py</code> 是整个项目的“点火钥匙”或“总开关”。它将数据、模型和训练过程解耦，使得研究人员可以仅仅通过修改配置文件，就能灵活地组合不同的数据和模型，进行各种实验，而无需修改代码。</p>
+<p><strong>执行流程图</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="nx">graph</span><span class="w"> </span><span class="nx">TD</span>
+<span class="w">    </span><span class="nx">A</span><span class="p">[</span><span class="nx">命令行</span><span class="p">:</span><span class="w"> </span><span class="nx">launch</span><span class="p">.</span><span class="nx">py</span><span class="w"> </span><span class="o">--</span><span class="nx">config</span><span class="w"> </span><span class="nx">config</span><span class="p">.</span><span class="nx">yaml</span><span class="w"> </span><span class="o">--</span><span class="nx">train</span><span class="p">]</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">B</span><span class="p">{</span><span class="nx">main</span><span class="w"> </span><span class="nx">函数</span><span class="p">};</span>
+<span class="w">    </span><span class="nx">B</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">C</span><span class="p">[</span><span class="nx">加载配置文件</span><span class="w"> </span><span class="nx">config</span><span class="p">.</span><span class="nx">yaml</span><span class="p">];</span>
+<span class="w">    </span><span class="nx">C</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">D</span><span class="p">[</span><span class="nx">设置</span><span class="w"> </span><span class="nx">GPU</span><span class="w"> </span><span class="nx">和随机种子</span><span class="p">];</span>
+<span class="w">    </span><span class="nx">D</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">E</span><span class="p">{</span><span class="nx">动态加载模块</span><span class="p">};</span>
+<span class="w">    </span><span class="nx">E</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">F</span><span class="p">[</span><span class="nx">实例化</span><span class="w"> </span><span class="nx">DataModule</span><span class="w"> </span><span class="p">(</span><span class="nx">由</span><span class="w"> </span><span class="nx">cfg</span><span class="p">.</span><span class="nx">data_type</span><span class="w"> </span><span class="nx">决定</span><span class="p">)];</span>
+<span class="w">    </span><span class="nx">E</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">G</span><span class="p">[</span><span class="nx">实例化</span><span class="w"> </span><span class="nx">System</span><span class="w"> </span><span class="p">(</span><span class="nx">由</span><span class="w"> </span><span class="nx">cfg</span><span class="p">.</span><span class="nx">system_type</span><span class="w"> </span><span class="nx">决定</span><span class="p">)];</span>
+<span class="w">    </span><span class="nx">G</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">H</span><span class="p">[</span><span class="nx">配置</span><span class="w"> </span><span class="nx">Trainer</span><span class="w"> </span><span class="p">(</span><span class="nx">Callbacks</span><span class="p">,</span><span class="w"> </span><span class="nx">Loggers</span><span class="p">)];</span>
+<span class="w">    </span><span class="nx">H</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">I</span><span class="p">{</span><span class="nx">根据</span><span class="w"> </span><span class="o">--</span><span class="nx">train</span><span class="o">/--</span><span class="nx">validate</span><span class="w"> </span><span class="nx">等参数</span><span class="p">};</span>
+<span class="w">    </span><span class="nx">I</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="nx">train</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">J</span><span class="p">[</span><span class="nx">调用</span><span class="w"> </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">fit</span><span class="p">];</span>
+<span class="w">    </span><span class="nx">I</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="nx">validate</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">K</span><span class="p">[</span><span class="nx">调用</span><span class="w"> </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">validate</span><span class="p">];</span>
+<span class="w">    </span><span class="nx">I</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="nx">test</span><span class="w"> </span><span class="o">--</span><span class="p">&gt;</span><span class="w"> </span><span class="nx">L</span><span class="p">[</span><span class="nx">调用</span><span class="w"> </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">test</span><span class="p">];</span>
+</code></pre></div>
+
+<p>理解 <code>launch.py</code> 对于掌握如何在本项目中运行训练和评估至关重要。它清晰地展示了如何利用 PyTorch Lightning 和配置文件驱动的方式来组织一个灵活的深度学习项目。</p>
+            </article>
+            
+            <nav class="page-nav"><a href="gaussian_diffusion.html" class="nav-link prev">← gaussian_diffusion.py 源码解析</a><a href="overview.html" class="nav-link next">DiffusionGS 项目总览 (Overview) →</a></nav>
+        </main>
+    </div>
+</body>
+</html>

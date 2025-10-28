@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base href="./">
+    <title>base_scene.py 源码解析</title>
+    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/highlight.css">
+    <script src="assets/script.js" defer></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$']],
+                displayMath: [['$$', '$$']],
+                processEscapes: false,
+                packages: {'[+]': ['noerrors', 'ams']}
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            },
+            loader: {
+                load: ['[tex]/noerrors', '[tex]/ams']
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h3>目录</h3>
+                <button id="sidebar-toggle" class="sidebar-toggle">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebar-search-input" placeholder="搜索..." autocomplete="off">
+            </div>
+            <div id="tree-container">
+                <ul class="nav-list"><li class="active"><a href="base_scene.html">base_scene.py 源码解析</a></li><li class=""><a href="denoiser.html">denoiser.py 源码解析</a></li><li class=""><a href="diffusion_gs_system_scene.html">diffusion_gs_system_scene.py 源码解析</a></li><li class=""><a href="gaussian_diffusion.html">gaussian_diffusion.py 源码解析</a></li><li class=""><a href="launch.html">launch.py 源码解析</a></li><li class=""><a href="overview.html">DiffusionGS 项目总览 (Overview)</a></li><li class=""><a href="paper.html">Untitled</a></li><li class=""><a href="pipline_obj.html">pipline_obj.py 源码解析</a></li><li class=""><a href="renderer.html">renderer.py 源码解析</a></li></ul>
+            </div>
+        </nav>
+        
+        <main class="content">
+            <article>
+                <h1 id="base_scenepy">base_scene.py 源码解析</h1>
+<p><code>diffusionGS/data/base_scene.py</code> 文件是场景重建任务数据处理的核心。虽然 <code>RE10K.py</code> 文件定义了 <code>Re10KDataModule</code>，但其核心的数据加载和预处理逻辑完全由本文件中的 <code>BaseDataset</code> 类实现。<code>BaseDataset</code> 负责从 RealEstate10K 数据集的原始文件中读取数据，并将其转换为模型训练所需的格式。</p>
+<h2 id="_1">核心类与功能</h2>
+<h3 id="basedataset"><code>BaseDataset</code> 类</h3>
+<p>这是继承自 <code>torch.utils.data.Dataset</code> 的核心数据集类。</p>
+<h4 id="__init__self-cfg-split"><code>__init__(self, cfg, split)</code></h4>
+<ul>
+<li><strong>功能</strong>: 初始化数据集，主要是加载场景列表。</li>
+<li><strong>流程</strong>:<ol>
+<li>根据 <code>split</code> 参数（<code>'train'</code> 或 <code>'val'</code>/<code>'test'</code>）从不同的路径（<code>cfg.local_dir</code> 或 <code>cfg.local_eval_dir</code>）读取一个包含所有场景 <code>data.json</code> 文件路径的列表。</li>
+<li>对于评估集（<code>'val'</code>/<code>'test'</code>），它会额外加载一个 <code>view_idx_file_path</code> 指定的 JSON 文件。这个文件预先定义了每个场景用于评估的<strong>输入视图</strong>和<strong>目标视图</strong>。这确保了评估的公平性和一致性。</li>
+<li>将加载的场景路径列表存储在 <code>self.uids</code> 中。</li>
+</ol>
+</li>
+</ul>
+<h4 id="__getitem__self-index"><code>__getitem__(self, index)</code></h4>
+<ul>
+<li><strong>功能</strong>: 加载并返回数据集中单个样本（即一个场景）的数据。这是 PyTorch <code>Dataset</code> 类的核心方法。</li>
+<li><strong>流程</strong>:<ol>
+<li>根据 <code>index</code> 获取场景的 <code>data.json</code> 文件路径。</li>
+<li><strong>视图选择 (View Selection)</strong>: 这是非常关键的一步。<ul>
+<li><strong>训练时</strong>: 从场景的所有可用帧中，<strong>随机</strong>采样 <code>self.cfg.sel_views + self.cfg.sel_views_train</code> 个视图。</li>
+<li><strong>评估时</strong>: 根据 <code>__init__</code> 中加载的 <code>view_idx_list</code>，选择<strong>预先指定</strong>的输入视图和目标视图。</li>
+</ul>
+</li>
+<li><strong>数据加载</strong>: 根据选择的视图索引，加载对应的图像、相机内参和外参（位姿）。</li>
+<li><strong>预处理 (<code>preprocess_frames</code> 和 <code>preprocess_poses</code>)</strong>: 对加载的数据进行严格的预处理，这是保证模型能够处理真实世界数据的关键。<ul>
+<li><code>preprocess_frames</code>: 调整图像尺寸，进行方形裁剪，并相应地调整相机内参（焦距和主点）。</li>
+<li><code>preprocess_poses</code>: <strong>位姿归一化</strong>。这是处理无边界大场景的核心步骤。它通过将坐标系对齐到所有相机的平均位姿，并将整个场景缩放到一个固定的尺寸，来解决不同场景相机位姿和尺度变化巨大的问题。</li>
+</ul>
+</li>
+<li><strong>返回字典</strong>: 将所有处理好的数据（图像 <code>rgbs</code>, 位姿 <code>c2ws</code>, 内参 <code>fxfycxcys</code> 等）打包成一个字典返回。</li>
+</ol>
+</li>
+</ul>
+<h4 id="collateself-batch"><code>collate(self, batch)</code></h4>
+<ul>
+<li><strong>功能</strong>: 自定义的 collate 函数，用于将 <code>__getitem__</code> 返回的多个字典样本合并成一个批次（Batch）的张量数据，以便输入模型。</li>
+</ul>
+<h2 id="_2">关键设计理念</h2>
+<ul>
+<li><strong>分离训练和评估的视图选择</strong>: 通过在训练时随机采样、在评估时使用固定视图，保证了模型的泛化能力和评估的可靠性。</li>
+<li><strong>位姿归一化 (Pose Normalization)</strong>: <code>preprocess_poses</code> 方法是处理像 RealEstate10K 这样的“in-the-wild”数据集的精髓。如果没有这一步，不同场景之间巨大的坐标和尺度差异将使得模型难以学习。这个方法通过创建一个“标准化的场景盒子”，将所有场景都归一化到这个盒子中，从而大大降低了学习难度。</li>
+<li><strong>基类设计</strong>: 将通用的场景数据处理逻辑放在 <code>BaseDataset</code> 中，使得添加新的场景数据集（如果数据格式类似）变得非常简单，只需继承 <code>BaseDEataset</code> 即可，如 <code>RE10K.py</code> 中所示。</li>
+</ul>
+<h2 id="_3">总结</h2>
+<p><code>base_scene.py</code> 是场景重建流程的数据处理中枢。它通过精巧的视图选择策略和至关重要的位姿归一化技术，成功地将多样化、无约束的 RealEstate10K 数据集转化为了格式统一、尺度一致、可供深度学习模型使用的标准训练数据。理解这个文件是理解 DiffusionGS 如何处理复杂真实世界场景的关键。</p>
+            </article>
+            
+            <nav class="page-nav"><a href="denoiser.html" class="nav-link next">denoiser.py 源码解析 →</a></nav>
+        </main>
+    </div>
+</body>
+</html>

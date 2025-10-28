@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base href="./">
+    <title>Untitled</title>
+    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/highlight.css">
+    <script src="assets/script.js" defer></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$']],
+                displayMath: [['$$', '$$']],
+                processEscapes: false,
+                packages: {'[+]': ['noerrors', 'ams']}
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            },
+            loader: {
+                load: ['[tex]/noerrors', '[tex]/ams']
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h3>目录</h3>
+                <button id="sidebar-toggle" class="sidebar-toggle">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebar-search-input" placeholder="搜索..." autocomplete="off">
+            </div>
+            <div id="tree-container">
+                <ul class="nav-list"><li class=""><a href="base_scene.html">base_scene.py 源码解析</a></li><li class=""><a href="denoiser.html">denoiser.py 源码解析</a></li><li class=""><a href="diffusion_gs_system_scene.html">diffusion_gs_system_scene.py 源码解析</a></li><li class=""><a href="gaussian_diffusion.html">gaussian_diffusion.py 源码解析</a></li><li class=""><a href="launch.html">launch.py 源码解析</a></li><li class=""><a href="overview.html">DiffusionGS 项目总览 (Overview)</a></li><li class="active"><a href="paper.html">Untitled</a></li><li class=""><a href="pipline_obj.html">pipline_obj.py 源码解析</a></li><li class=""><a href="renderer.html">renderer.py 源码解析</a></li></ul>
+            </div>
+        </nav>
+        
+        <main class="content">
+            <article>
+                <p>下面把论文 <strong>Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single‑stage Image‑to‑3D Generation and Reconstruction（DiffusionGS）</strong> 的方法、训练目标与实验结果，<strong>逐段对齐到你给的 markdown 里的代码结构</strong>，并给出实现要点与复现实操清单。为方便阅读，我按“论文→代码”的映射来讲。</p>
+<hr />
+<h2 id="0">0) 论文一页概览（先立靶）</h2>
+<ul>
+<li><strong>核心思想</strong>：把 <strong>3D 高斯（3DGS）渲染与表示</strong>“烘进”扩散<strong>去噪器</strong>本体：去噪器在每个时间步<strong>直接预测像素对齐的 3D 高斯参数</strong>，随后以可微栅格化渲染出多视图作为监督；训练时混合<strong>物体/场景</strong>数据并提出新的<strong>RPPC 相机条件</strong>替代传统 Plücker 线，增强几何/深度感知。</li>
+<li><strong>训练与推理</strong>：训练时输入“1 张条件清晰图 + N 张带噪视图”，去噪器输出每像素 3D 高斯；渲染得到去噪后的多视图作损失回传。推理时从噪声开始逐步去噪、步步产生 3D 高斯并渲染。</li>
+<li><strong>指标与速度</strong>：在物体与场景上分别较 SOTA 提升 <strong>PSNR/FID 2.20 dB/23.25 和 1.34 dB/19.16</strong>，A100 <strong>单张约 6 秒</strong>。</li>
+</ul>
+<hr />
+<h2 id="1-fig4b-dgsdenoiser">1) 去噪器架构：论文 Fig.4(b) → 代码 <code>DGSDenoiser</code></h2>
+<p><strong>论文</strong>：输入为图像 + 相机条件，经 <strong>Patchify → 位置/时间步嵌入 → Transformer L 层</strong>，输出送入 <strong>Gaussian Decoder</strong> 得到 <strong>每像素 H×W×14 维的高斯图</strong>（每像素一个 3D 高斯：中心 μ、协方差 Σ、透明度 α、RGB c 等），再合并成所有视图的点云并用可微渲染器监督。文中明确去噪器为 <strong>x₀‑prediction</strong>（直接预测干净目标而非 ε）。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<p><strong>代码</strong>：<code>DGSDenoiser</code> 把上述步骤拆成可复用部件：
+<code>image_tokenizer</code>（Patchify/线性投影）、<code>t_embedder</code>（时间步嵌入）、<code>transformer</code>（DiT Blocks）、<code>image_token_decoder / GaussiansUpsampler</code>（把 token 解码为高斯参数）、以及 <code>gs_renderer</code>（后述）。<code>image_to_gaussians</code> 完成<strong>图像+光（ray_o, ray_d）→ token → Transformer → 解码 → 3D 高斯</strong>全流程，随后 <code>render_gaussians</code> 负责渲染。</p>
+<blockquote>
+<p>对齐结论：<strong>Fig.4(b) 的每个框都能在 <code>denoiser.py</code> 里定位到对应子模块与前向路径</strong>；论文里“Gaussian decoder”在代码中由 <code>GaussiansUpsampler</code> 与 <code>ImageTokenDecoder</code> 共同承接。</p>
+</blockquote>
+<hr />
+<h2 id="2-3d-gs-renderer">2) 3D 表示与渲染：论文的可微 GS 栅格化 → 代码 <code>Renderer</code></h2>
+<p><strong>论文</strong>：将每像素的 3D 高斯按 2D 投影<strong>分配到瓦片</strong>，按<strong>视深</strong>排序后<strong>混合/累积</strong>得到像素 RGB；这一过程是训练和推理都依赖的可微渲染算子。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<p><strong>代码</strong>：<code>renderer.py</code> 的 <code>Renderer.forward</code> 默认走 <strong>deferred_gaussian_render</strong>（自定义 CUDA 内核），可一次性并行渲染批量/多视图；若禁用则逐视图调用 <code>render_opencv_cam</code>。这正是论文强调的<strong>速度来源</strong>之一。</p>
+<blockquote>
+<p>对齐结论：论文里的“可微栅格化”在工程上就是 <strong>Deferred GS 渲染</strong>；<strong>A100 单张约 6s</strong> 的率与该实现密切相关。 </p>
+</blockquote>
+<hr />
+<h2 id="3-rppc">3) 相机条件：论文 RPPC → 代码中的光线/姿态通道</h2>
+<p><strong>论文</strong>：提出<strong>Reference‑Point Plücker Coordinates（RPPC）</strong>：把每条相机射线换成与世界原点最近的参考点 <strong>r = o − (o·d) d</strong>（o/d 为射线原点/方向），以强化<strong>相对深度与几何</strong>，并通过 skip‑connection 让该信息贯穿 Transformer 与解码器。</p>
+<p><strong>代码</strong>：<code>DGSDenoiser.image_to_gaussians</code> 接收 <strong>ray_o / ray_d</strong> 与图像一同“姿态化”（posed images）进入 tokenizer/Transformer，从工程层面承载了<strong>RPPC 思路下的相机/光线条件</strong>；同时场景系统里对<strong>深度范围</strong>有专门适配。</p>
+<blockquote>
+<p>对齐结论：<strong>RPPC 的几何先验在代码里体现为“光线索（Plenoptic Cues）”通道</strong>，即把 rays 作为条件输入参与 token 计算与后续坐标校正。</p>
+</blockquote>
+<hr />
+<h2 id="4-3d-18-gaussiandiffusion">4) 单阶段 3D 扩散：论文公式 (1)(8) → 代码 <code>GaussianDiffusion</code></h2>
+<p><strong>论文</strong>：前向加噪 <code>x_t = ᾱ_t x_0 + sqrt(1-ᾱ_t) ε</code>每步去噪后<strong>渲染</strong>得到 <code>x̂_(0,t)</code>，再用于下一步采样，直至 <code>t=0</code>。<strong>训练</strong>做 x₀‑prediction（非 ε‑prediction），以 2D 渲染监督 3D 高斯。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<p><strong>代码</strong>：<code>gaussian_diffusion.py</code> 完成<strong>q_sample（前向加噪）</strong>、<strong>p_mean_variance / p_sample</strong>、<strong>p_sample_loop_progressive（完整去噪）</strong>与 <strong>training_losses</strong>，是系统的“扩散骨架”。论文里的时间推进/回传，对应这四组函数的调用。</p>
+<blockquote>
+<p>对齐结论：<strong>数学在论文、算法在 <code>gaussian_diffusion.py</code>，具体 3D 预测靠 <code>DGSDenoiser</code></strong>。</p>
+</blockquote>
+<hr />
+<h2 id="5-l_de-l_nv-l_pd">5) 训练目标：论文 L_de / L_nv / L_pd → 代码里的损失计算路径</h2>
+<p><strong>论文</strong>：</p>
+<ul>
+<li><strong>Denoising Loss</strong>：<code>L_de = L2(x̂_(0,t), X0) + λ·L_VGG</code>；</li>
+<li><strong>Novel‑View Loss</strong>：对未条件的监督视图同样计算 L2+VGG；</li>
+<li><strong>Point‑Distribution Loss</strong>：warm‑up 阶段压缩物体点云的分布（式 (12)）；整体目标 <code>L = (L_de + L_nv)·1_iter&gt;iter0 + L_pd·1_iter≤iter0·1_object</code>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+</ul>
+<p><strong>代码</strong>：系统模块在 <code>forward/training_step</code> 里先 <strong>加噪非条件视图 → <code>image_to_gaussians</code> 预测高斯 → <code>render_gaussians</code> 渲染 → <code>loss_computer</code> 比较渲染与 GT</strong>（含感知损失等），路径与论文一致；场景版还包含<strong>中间轨迹视频/评测文件</strong>的保存逻辑。</p>
+<hr />
+<h2 id="6-fig4a">6) <strong>场景‑物体混合训练</strong>与<strong>视角选择约束</strong>：论文 Fig.4(a) → 代码数据与系统</h2>
+<p><strong>论文</strong>：混合物体/场景数据时，为避免域差异导致的不收敛，对<strong>相机位置与朝向</strong>施加两个角度约束（式 (9)），并用<strong>双解码器</strong>分别适配物体/场景的<strong>深度范围</strong>（物体 <code>[0.1,4.2]</code>，场景 <code>[0,500]</code>）。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+<p><strong>代码</strong>：</p>
+<ul>
+<li>数据侧：<code>BaseDataset</code> 进行<strong>随机/指定视图选择</strong>、尺寸裁剪/内参同步、以及<strong>位姿归一化</strong>（大场景的关键）。</li>
+<li>系统侧：场景版 <code>PointDiffusionSystem</code> 复用核心逻辑但<strong>适配深度范围与结果保存</strong>，与论文“场景/物体不同成像深”的实现要点一致；同时也提供<strong>推理轨迹导出</strong>以观察扩散过程。</li>
+<li>模型侧：概念上的“<strong>双解码器</strong>”在工程上体现在<strong>物体/场景两个去噪器/解码路径</strong>（如 <code>denoiser.py / denoiser_scene.py</code> 的分工与不同深度裁剪/尺度设置）。</li>
+</ul>
+<hr />
+<h2 id="7-systempipelinelaunch">7) 端到端执行流：论文采样循环 → 代码 <code>System</code>/<code>Pipeline</code>/<code>Launch</code></h2>
+<p><strong>训练 / 推理（系统态）</strong></p>
+<ol>
+<li><code>launch.py</code> 读 YAML，动态构建 <strong>DataModule + System</strong>，接上 Lightning <code>Trainer</code> 与回调/日志。</li>
+<li><code>PointDiffusionSystem.forward</code>：<strong>加噪 → <code>DGSDenoiser.image_to_gaussians</code> → <code>Renderer.forward</code> → 计算损失</strong>。验证/推理则调用 <strong><code>diffusion_inference.p_sample_loop_progressive</code></strong> 完整扩散。</li>
+<li><code>gaussian_diffusion.p_sample_loop_progressive</code>：<strong>t=T…0</strong> 迭代，每步都调用去噪器、渲染出 <code>x̂_(0,t)</code> 并反馈给下一步（式 (8)），直至得到最终 3D 高斯与渲染图。</li>
+</ol>
+<p><strong>单图物体生成（用户态）</strong>
+<code>DiffusionGSPipeline.from_pretrained → __call__</code>：预处理去背景/居中裁剪 → 构造相机模板与噪声 → 一行调用 <strong><code>system.diffusion_inference.p_sample_loop_progressive</code></strong> 得到<strong>高斯+渲染</strong>结果并做阈值过滤。</p>
+<blockquote>
+<p>这一路径与论文“单阶段 3D 扩散 + 可微渲染监督”的采样与训练闭环严格一致。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</p>
+</blockquote>
+<hr />
+<h2 id="8">8) 实验要点与消融（对齐实现）</h2>
+<ul>
+<li><strong>总对比</strong>：在 ABO/GSO/RealEstate10K 上相较多种两阶段/3D 扩散与多视图方法取得更高 PSNR/SSIM/LPIPS、显著更低 FID；可处理<strong>毛绒材质/高反/扁平插画/复杂几何</strong>等难例。</li>
+<li><strong>与 2D 合成 + 事后 3DGS</strong>（PhotoNVS+post‑hoc）对比：后者易模糊/伪影/深度不稳；DiffusionGS 因沿相机轨迹生成多视角而无须单目深度估计器即可复原遮挡与结构。</li>
+<li><strong>消融</strong>：去掉时间步控制、混合训练或 RPPC，PSNR/FID 均明显退化（式 (12) 给出 L_pd 的定义；表 2 与定性图展示对 RPPC/混合训练的收益）。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+</ul>
+<hr />
+<h2 id="9-tips">9) 关键工程 Tips（落到代码）</h2>
+<ol>
+<li><strong>速度</strong>：务必使用 <code>Renderer</code> 的 <strong>deferred</strong> 模式（CUDA 内核批量渲染）；否则逐视图渲染会成为瓶颈。</li>
+<li><strong>几何先验</strong>：把 <strong>ray_o / ray_d</strong> 作为条件输入，并在像素对齐高斯的 <strong>XYZ 校正</strong>中用上（对应 RPPC 思路）。 </li>
+<li><strong>大场景训练</strong>：开启/复用 <strong>位姿归一化</strong>（<code>preprocess_poses</code>），把不同视频的尺度/坐标对齐到统一盒子，否则训练会不稳。</li>
+<li><strong>物体 vs 场景</strong>：注意<strong>深度范围</strong>与<strong>解码器差异</strong>（物体短、场景远），在系统/模型配置里分开设置。</li>
+<li><strong>训练组织</strong>：System 中的 <strong>“加噪→预测高斯→渲染→多项损失”</strong> 四拍节奏要与 <strong><code>GaussianDiffusion.training_losses</code></strong> 的时间步采样一致。</li>
+</ol>
+<hr />
+<h2 id="10">10) 复现实操（从零到跑通）</h2>
+<ul>
+<li><strong>研究式训练/验证</strong>：<code>python launch.py --config configs/xxx.yaml --train/--validate</code>（所有模块通过 <code>cfg.data_type / cfg.system_type</code> 动态注册，Lightning 负责调度/日志/EMA/Checkpoint）。</li>
+<li><strong>即用式物体生成</strong>：</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">diffusionGS.pipline_obj</span> <span class="kn">import</span> <span class="n">DiffusionGSPipeline</span>
+<span class="n">pipe</span> <span class="o">=</span> <span class="n">DiffusionGSPipeline</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="s2">&quot;…权重…&quot;</span><span class="p">)</span>
+<span class="n">out</span>  <span class="o">=</span> <span class="n">pipe</span><span class="p">(</span><span class="n">image</span><span class="o">=</span><span class="s2">&quot;input.png&quot;</span><span class="p">)</span>   <span class="c1"># 返回 3D 高斯与渲染图</span>
+</code></pre></div>
+
+<p>管道内部已封装相机模板、噪声初始化与扩散采样循环。</p>
+<hr />
+<h2 id="11">11) 方法—代码—文件一览（速查）</h2>
+<ul>
+<li><strong>扩散骨架</strong>：公式(1)(8) ↔ <code>GaussianDiffusion.{q_sample,p_sample_loop_progressive,…}</code>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>) </li>
+<li><strong>去噪器/Transformer</strong>：Fig.4(b) ↔ <code>DGSDenoiser.{image_tokenizer, transformer, …}</code>。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>) </li>
+<li><strong>RPPC 相机条件</strong>：式(11) ↔ rays 条件（<code>ray_o, ray_d</code>/姿态化图像）。 </li>
+<li><strong>可微 GS 渲染</strong>：tile‑based 深度排序/混合 ↔ <code>Renderer.forward</code>（deferred CUDA）。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>) </li>
+<li><strong>混合训练与角度约束</strong>：Fig.4(a)/式(9) ↔ DataModule 采样策略 + System 配置。(<a href="https://arxiv.org/pdf/2411.14384" title="Baking Gaussian Splatting into Diffusion Denoiser for Fast and Scalable Single-stage Image-to-3D Generation and Reconstruction">arXiv</a>)</li>
+<li><strong>场景专用系统</strong>：保存中间轨迹/评测结果/PLY。</li>
+<li><strong>启动/调度</strong>：<code>launch.py</code> 配置驱动 + Lightning。</li>
+<li><strong>面向用户的物体生成</strong>：<code>DiffusionGSPipeline.from_pretrained / __call__</code>。</li>
+<li><strong>整体关系与调用图</strong>：见总览文档中的引擎/点火钥匙解释与时序图。</li>
+</ul>
+<hr />
+<h3 id="_1">小结</h3>
+<ul>
+<li>这篇工作把 <strong>3DGS</strong> 作为<strong>去噪器的输出空间</strong>，以<strong>渲染损失</strong>建立<strong>2D↔3D</strong>的一阶段闭环；</li>
+<li>相机条件由 <strong>RPPC</strong> 提升了<strong>深度/几何</strong>表达；</li>
+<li>工程上依赖 <strong>deferred CUDA 渲染</strong> 与<strong>Lightning‑化的系统</strong>得到 <strong>~6s/A100</strong> 的推理速度与良好的可扩展性（物体 ↔ 场景）。</li>
+<li>你给的这些源码 md 基本覆写了论文各模块：<strong>DGSDenoiser/Renderer/GaussianDiffusion/System/Data/Pipeline/Launch</strong>，可直接按上面“复现实操”跑通。</li>
+</ul>
+<hr />
+<p>下面把要点<strong>整理成 4 张表</strong>：模块对照、训练/推理流程、场景/物体差异与数据、运行入口与管道。每行都给出对应 markdown 的定位作为依据。</p>
+<h3 id="_2">表一：论文概念 ↔ 代码模块（核心对照）</h3>
+<p>| 论文概念 / 术语             | 代码模块/文件                                      | 职责与实现要点                                                                                              |</p>
+<table>
+<thead>
+<tr>
+<th>论文概念 / 术语</th>
+<th>代码模块/文件</th>
+<th>职责与实现要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>去噪器（DiT 主干 + 高斯解码器）</td>
+<td><code>DGSDenoiser</code>（<code>denoiser.py</code>）</td>
+<td>图像+光线（ray_o/ray_d）→ Token → Transformer → 解码出全局高斯与像素对齐高斯；含时间步嵌入与XYZ校正；内置 <code>Renderer</code> 进行渲染。</td>
+</tr>
+<tr>
+<td>扩散骨架（q/p 过程、采样循环）</td>
+<td><code>GaussianDiffusion</code>（<code>gaussian_diffusion.py</code>）</td>
+<td>实现 <code>q_sample</code>、<code>p_mean_variance</code>、<code>p_sample</code>、<code>p_sample_loop_progressive</code> 与 <code>training_losses</code>，与具体去噪器解耦。</td>
+</tr>
+<tr>
+<td>可微 3DGS 渲染</td>
+<td><code>Renderer</code> / <code>SceneRenderer</code>（<code>renderer.py</code>）</td>
+<td>默认 <strong>deferred</strong>（CUDA）批渲染，大幅提速；备用顺序渲染可输出深度/alpha。</td>
+</tr>
+<tr>
+<td>系统协调（LightningModule）</td>
+<td><code>PointDiffusionSystem</code>（物体/场景版）</td>
+<td>训练：加噪→<code>image_to_gaussians</code>→渲染→损失；验证：构造输入→调用扩散采样；场景版增加中间轨迹视频/评测结果/PLY 保存。</td>
+</tr>
+<tr>
+<td>数据与几何规范化</td>
+<td><code>BaseDataset</code>（<code>base_scene.py</code>）</td>
+<td>视图选择（训练随机/评估固定）；<code>preprocess_frames/poses</code> 做尺寸与<strong>位姿归一化</strong>，统一尺度/坐标。</td>
+</tr>
+<tr>
+<td>项目总览/概念框架</td>
+<td><code>overview.md</code></td>
+<td>名词/动词/引擎/点火钥匙的全局解释与模块关系图。</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="_3">表二：训练与推理（端到端调用链）</h3>
+<p>| 阶段                 | 入口/函数                                        | 关键步骤                                                                                                           | 依据 |</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>入口/函数</th>
+<th>关键步骤</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练（系统态）</td>
+<td><code>PointDiffusionSystem.forward/training_step</code></td>
+<td>给非条件视图加噪 → <code>DGSDenoiser.image_to_gaussians</code> 预测 3D 高斯 → <code>Renderer.forward</code> 渲染 → 计算损失与回传。</td>
+<td></td>
+</tr>
+<tr>
+<td>推理/验证（系统态）</td>
+<td><code>validation_step</code> + <code>diffusion_inference</code></td>
+<td>构造 <code>input_batch</code>（条件图像/相机/噪声）→ <code>GaussianDiffusion.p_sample_loop_progressive</code> 逐步去噪生成 → 渲染/保存（场景版支持轨迹视频/评测包/PLY）。</td>
+<td></td>
+</tr>
+<tr>
+<td>物体生成（用户态 Pipeline）</td>
+<td><code>DiffusionGSPipeline.__call__</code></td>
+<td>预处理图（去背/裁剪/居中）→ 准备相机与初始噪声 → 调用系统的 <code>p_sample_loop_progressive</code> → 过滤高斯并返回结果。</td>
+<td></td>
+</tr>
+<tr>
+<td>训练/验证启动（脚本态）</td>
+<td><code>launch.py</code></td>
+<td>解析 YAML → 动态实例化 DataModule/System → 配置 Lightning <code>Trainer</code>（回调/日志/EMA）→ <code>fit/validate/test/predict</code>。</td>
+<td></td>
+</tr>
+<tr>
+<td>渲染策略</td>
+<td><code>Renderer.forward</code></td>
+<td><strong>deferred</strong>（CUDA 聚合批/多视图）优先；不开启时逐视图调用 <code>render_opencv_cam</code>。</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="vs">表三：场景 vs 物体 &amp; 数据侧要点</h3>
+<p>| 主题   | 物体任务                         | 场景任务                                                    | 依据 |</p>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>物体任务</th>
+<th>场景任务</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>系统类</td>
+<td><code>diffusion_gs_system.py</code>（物体）</td>
+<td><code>diffusion_gs_system_scene.py</code>（场景特化）</td>
+<td></td>
+</tr>
+<tr>
+<td>验证产物</td>
+<td>常规图像/日志</td>
+<td>另存 <strong>traj_xt/traj_xstart</strong> 视频、评测 <code>.pt</code>、以及 <strong>.ply</strong> 高斯点云</td>
+<td></td>
+</tr>
+<tr>
+<td>数据处理</td>
+<td>物体数据（相机/深度范围短）</td>
+<td>RealEstate10K 等“in-the-wild”；<strong>视图固定评估</strong>，<strong>位姿归一化</strong>极关键</td>
+<td></td>
+</tr>
+<tr>
+<td>渲染器</td>
+<td><code>Renderer</code></td>
+<td><code>SceneRenderer</code>（场景版 deferred 渲染）</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="_4">表四：运行入口与上层封装</h3>
+<p>| 入口/文件            | 作用                                               | 备注              |</p>
+<table>
+<thead>
+<tr>
+<th>入口/文件</th>
+<th>作用</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>overview.md</code></td>
+<td>全局结构速与名词/动词/引擎/钥匙心智模型</td>
+<td>新成员上手首选。</td>
+</tr>
+<tr>
+<td><code>launch.py</code></td>
+<td>通用点火：解析配置→实例化模块→交给 Lightning 执行</td>
+<td>研究/训练/评测统一入口。</td>
+</tr>
+<tr>
+<td><code>pipline_obj.py</code></td>
+<td>物体生成一站式 Pipeline（<code>from_pretrained</code> / <code>__call__</code>）</td>
+<td>面向用户/应用的最简 API。</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>以上表格把论文方法与代码实现一一对齐：<strong>去噪器/扩散/渲染/系统/数据/入口</strong>六层次，分别落在 <code>denoiser.py</code>、<code>gaussian_diffusion.py</code>、<code>renderer.py</code>、场景系统与数据集、以及 <code>launch.py</code>/<code>pipline_obj.py</code> 中。如需，我可以再补一张“关键配置项对照表（YAML 字段 ↔ 模块参数）”。</p>
+</blockquote>
+            </article>
+            
+            <nav class="page-nav"><a href="overview.html" class="nav-link prev">← DiffusionGS 项目总览 (Overview)</a><a href="pipline_obj.html" class="nav-link next">pipline_obj.py 源码解析 →</a></nav>
+        </main>
+    </div>
+</body>
+</html>

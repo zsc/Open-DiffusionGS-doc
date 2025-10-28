@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <base href="./">
+    <title>gaussian_diffusion.py 源码解析</title>
+    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/highlight.css">
+    <script src="assets/script.js" defer></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$']],
+                displayMath: [['$$', '$$']],
+                processEscapes: false,
+                packages: {'[+]': ['noerrors', 'ams']}
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            },
+            loader: {
+                load: ['[tex]/noerrors', '[tex]/ams']
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h3>目录</h3>
+                <button id="sidebar-toggle" class="sidebar-toggle">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebar-search-input" placeholder="搜索..." autocomplete="off">
+            </div>
+            <div id="tree-container">
+                <ul class="nav-list"><li class=""><a href="base_scene.html">base_scene.py 源码解析</a></li><li class=""><a href="denoiser.html">denoiser.py 源码解析</a></li><li class=""><a href="diffusion_gs_system_scene.html">diffusion_gs_system_scene.py 源码解析</a></li><li class="active"><a href="gaussian_diffusion.html">gaussian_diffusion.py 源码解析</a></li><li class=""><a href="launch.html">launch.py 源码解析</a></li><li class=""><a href="overview.html">DiffusionGS 项目总览 (Overview)</a></li><li class=""><a href="paper.html">Untitled</a></li><li class=""><a href="pipline_obj.html">pipline_obj.py 源码解析</a></li><li class=""><a href="renderer.html">renderer.py 源码解析</a></li></ul>
+            </div>
+        </nav>
+        
+        <main class="content">
+            <article>
+                <h1 id="gaussian_diffusionpy">gaussian_diffusion.py 源码解析</h1>
+<p><code>gaussian_diffusion.py</code> 文件是 DiffusionGS 项目的<strong>数学核心和算法引擎</strong>。它实现了一个标准的高斯扩散模型，包含了前向加噪（Forward Process）和反向去噪（Reverse Process）的完整算法。这个文件不包含任何具体的神经网络结构（如 U-Net 或 Transformer），而是一个通用的框架，可以与任何去噪模型（<code>denoiser</code>）协同工作。该实现很大程度上借鉴了 OpenAI 在 GLIDE, ADM, IDDPM 等项目中的代码。</p>
+<h2 id="_1">核心类与功能</h2>
+<h3 id="gaussiandiffusion"><code>GaussianDiffusion</code> 类</h3>
+<p>这个类封装了扩散模型的所有数学细节和核心算法。</p>
+<h4 id="__init__self-betas-model_mean_type-model_var_type-loss_type"><code>__init__(self, *, betas, model_mean_type, model_var_type, loss_type)</code></h4>
+<ul>
+<li><strong>功能</strong>: 初始化扩散过程所需的所有参数。</li>
+<li><strong>核心参数</strong>:<ul>
+<li><code>betas</code>: 一个一维 Numpy 数组，定义了每个时间步 <code>t</code> 的噪声方差 <code>β_t</code>。这是扩散过程的<strong>核心超参数</strong>，决定了噪声的添加速率。</li>
+<li><code>model_mean_type</code>: 一个枚举类型，指定了去噪模型预测的目标。通常是 <code>START_X</code>（预测原始图像 <code>x_0</code>）或 <code>EPSILON</code>（预测添加的噪声 <code>ε</code>）。</li>
+</ul>
+</li>
+<li><strong>预计算</strong>: 在初始化过程中，该类会根据 <code>betas</code> 预计算出所有后续步骤需要用到的常量，例如 <code>alphas</code>, <code>alphas_cumprod</code>, <code>sqrt_alphas_cumprod</code> 等。这些常量是扩散过程数学公式中的关键部分，预计算可以大大提高后续训练和采样的效率。</li>
+</ul>
+<h4 id="q_sampleself-x_start-t-noisenone"><code>q_sample(self, x_start, t, noise=None)</code></h4>
+<ul>
+<li><strong>功能</strong>: 执行<strong>前向加噪过程 (Forward Process)</strong>，即从 <code>q(x_t | x_0)</code> 中采样。</li>
+<li><strong>流程</strong>: 接收清晰的原始数据 <code>x_start</code> 和一个时间步 <code>t</code>，根据预计算好的 <code>sqrt_alphas_cumprod</code> 和 <code>sqrt_one_minus_alphas_cumprod</code>，利用重参数化技巧，一步到位地生成在 <code>t</code> 时刻的带噪声样本 <code>x_t</code>。<ul>
+<li><code>x_t = sqrt(α_bar_t) * x_0 + sqrt(1 - α_bar_t) * ε</code></li>
+</ul>
+</li>
+</ul>
+<h4 id="p_mean_varianceself-model"><code>p_mean_variance(self, model, ...)</code></h4>
+<ul>
+<li><strong>功能</strong>: 估算反向过程中的均值和方差，即 <code>p(x_{t-1} | x_t)</code> 的均值和方差。</li>
+<li><strong>流程</strong>:<ol>
+<li>调用外部传入的 <code>model</code>（即 <code>DGSDenoiser</code>）来获得其在当前时间步 <code>t</code> 的预测结果（例如，预测的 <code>x_0</code> 或 <code>ε</code>）。</li>
+<li>根据模型的预测结果，计算出后验分布 <code>q(x_{t-1} | x_t, x_0)</code> 的均值和方差。在扩散模型中，这个后验分布被用来近似我们想要学习的目标分布 <code>p(x_{t-1} | x_t)</code>。</li>
+</ol>
+</li>
+</ul>
+<h4 id="p_sampleself-model"><code>p_sample(self, model, ...)</code></h4>
+<ul>
+<li><strong>功能</strong>: 执行<strong>一步</strong>反向去噪过程，即从 <code>p(x_{t-1} | x_t)</code> 中采样得到 <code>x_{t-1}</code>。</li>
+<li><strong>流程</strong>: <ol>
+<li>调用 <code>p_mean_variance</code> 获得去噪后分布的均值和方差。</li>
+<li>从这个高斯分布中进行一次采样，得到 <code>x_{t-1}</code>。如果 <code>t &gt; 0</code>，会加入一个随机噪声项；如果 <code>t = 0</code>，则不加噪声，直接返回均值。</li>
+</ol>
+</li>
+</ul>
+<h4 id="p_sample_loop_progressiveself-model"><code>p_sample_loop_progressive(self, model, ...)</code></h4>
+<ul>
+<li><strong>功能</strong>: 执行<strong>完整</strong>的反向去噪循环，从纯噪声 <code>x_T</code> 生成清晰的样本 <code>x_0</code>。</li>
+<li><strong>流程</strong>: 这是一个生成器函数。它从 <code>t = T-1</code> 开始，循环迭代直到 <code>t = 0</code>。<ol>
+<li>在每个时间步 <code>t</code>，调用 <code>p_sample</code> 方法来从 <code>x_t</code> 生成 <code>x_{t-1}</code>。</li>
+<li>使用 <code>yield</code> 返回每一步的结果，使得调用者可以观察到从噪声到清晰图像的渐进过程。
+*   <strong>这是在 <code>PointDiffusionSystem</code> 和 <code>DiffusionGSPipeline</code> 中被调用的核心推理函数。</strong></li>
+</ol>
+</li>
+</ul>
+<h4 id="training_lossesself-model"><code>training_losses(self, model, ...)</code></h4>
+<ul>
+<li><strong>功能</strong>: 计算训练过程中的损失。</li>
+<li><strong>流程</strong>:<ol>
+<li>从数据 <code>batch</code> 中获取清晰的 <code>x_start</code>。</li>
+<li>随机选择一个时间步 <code>t</code>。</li>
+<li>调用 <code>q_sample</code> 生成带噪声的 <code>x_t</code>。</li>
+<li>将 <code>x_t</code> 和 <code>t</code> 输入到 <code>model</code> 中，获得模型的预测结果（例如，预测的 <code>x_0</code> 或 <code>ε</code>）。</li>
+<li>根据 <code>model_mean_type</code>，将模型的预测结果与真实目标（真实的 <code>x_0</code> 或 <code>ε</code>）进行比较，计算 <strong>MSE 损失</strong>。</li>
+</ol>
+</li>
+</ul>
+<h2 id="_2">总结</h2>
+<p><code>gaussian_diffusion.py</code> 是一个与具体模型无关的、纯粹的算法实现。它为整个项目提供了扩散模型的数学骨架。任何遵循其输入输出规范的去噪模型（如本项目中的 <code>DGSDenoiser</code>）都可以被插入到这个框架中，进行训练和采样。</p>
+<p>理解这个文件是深入理解扩散模型工作原理的关键。它清晰地展示了：</p>
+<ul>
+<li><strong>前向过程</strong>如何通过一个固定的数学公式向数据中添加噪声。</li>
+<li><strong>反向过程</strong>如何通过一个学习到的神经网络，逐步地将噪声移除，最终恢复出原始数据。</li>
+<li><strong>训练损失</strong>是如何通过让模型预测噪声或原始数据来计算的。</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="n">graph</span><span class="w"> </span><span class="n">TD</span>
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">前向过程</span><span class="w"> </span><span class="p">(</span><span class="n">q_sample</span><span class="p">)</span>
+<span class="w">        </span><span class="n">A</span><span class="o">[</span><span class="n">x_0: 清晰图像</span><span class="o">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">B</span><span class="err">{</span><span class="n">数学公式</span><span class="err">}</span><span class="p">;</span><span class="w"> </span>
+<span class="w">        </span><span class="n">C</span><span class="o">[</span><span class="n">t: 时间步</span><span class="o">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">B</span><span class="p">;</span>
+<span class="w">        </span><span class="n">B</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D</span><span class="o">[</span><span class="n">x_t: 带噪声图像</span><span class="o">]</span><span class="p">;</span>
+<span class="w">    </span><span class="k">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">反向过程</span><span class="w"> </span><span class="p">(</span><span class="n">p_sample_loop</span><span class="p">)</span>
+<span class="w">        </span><span class="n">E</span><span class="o">[</span><span class="n">x_T: 纯噪声</span><span class="o">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">F</span><span class="err">{</span><span class="n">p_sample</span><span class="w"> </span><span class="n">循环</span><span class="err">}</span><span class="p">;</span>
+<span class="w">        </span><span class="n">F</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G</span><span class="o">[</span><span class="n">调用 DGSDenoiser 预测</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">G</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">H</span><span class="o">[</span><span class="n">计算 x_{t-1}</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">H</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">F</span><span class="p">;</span>
+<span class="w">        </span><span class="n">F</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">I</span><span class="o">[</span><span class="n">x_0: 生成图像</span><span class="o">]</span><span class="p">;</span>
+<span class="w">    </span><span class="k">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">训练</span><span class="w"> </span><span class="p">(</span><span class="n">training_losses</span><span class="p">)</span>
+<span class="w">        </span><span class="n">J</span><span class="o">[</span><span class="n">x_0: 清晰图像</span><span class="o">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">K</span><span class="err">{</span><span class="n">q_sample</span><span class="err">}</span><span class="p">;</span>
+<span class="w">        </span><span class="n">K</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">L</span><span class="o">[</span><span class="n">x_t: 带噪声图像</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">L</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">M</span><span class="o">[</span><span class="n">DGSDenoiser</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">M</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">N</span><span class="o">[</span><span class="n">预测的 x_0 或 ε</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">O</span><span class="o">[</span><span class="n">真实的 x_0 或 ε</span><span class="o">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">P</span><span class="err">{</span><span class="n">MSE</span><span class="w"> </span><span class="n">损失</span><span class="err">}</span><span class="p">;</span>
+<span class="w">        </span><span class="n">N</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">P</span><span class="p">;</span>
+<span class="w">    </span><span class="k">end</span>
+</code></pre></div>
+            </article>
+            
+            <nav class="page-nav"><a href="diffusion_gs_system_scene.html" class="nav-link prev">← diffusion_gs_system_scene.py 源码解析</a><a href="launch.html" class="nav-link next">launch.py 源码解析 →</a></nav>
+        </main>
+    </div>
+</body>
+</html>
